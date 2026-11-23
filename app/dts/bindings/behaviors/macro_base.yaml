@@ -11,3 +11,6 @@ properties:
   tap-ms:
     type: int
     description: The default time to wait (in milliseconds) between the press and release events on a tapped macro behavior binding
+  gremlin-slot:
+    type: int
+    required: false

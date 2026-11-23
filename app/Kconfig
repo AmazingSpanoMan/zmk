@@ -443,6 +443,11 @@ config ZMK_COMBO_MAX_PRESSED_COMBOS
     int "Maximum number of currently pressed combos"
     default 4
 
+config ZMK_COMBO_RUNTIME_SLOTS
+    int "Number of runtime-configurable combo slots (0 = static DTS combos only)"
+    default 0
+    range 0 32
+
 config ZMK_COMBO_MAX_COMBOS_PER_KEY
     int "Deprecated: Max combos per key"
     default 0

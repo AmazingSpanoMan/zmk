@@ -49,3 +49,6 @@ properties:
     default: []
   hold-trigger-on-release:
     type: boolean
+  gremlin-slot:
+    type: int
+    required: false

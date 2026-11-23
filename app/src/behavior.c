@@ -23,6 +23,7 @@
 
 #include <drivers/behavior.h>
 #include <zmk/behavior.h>
+#include <zmk/gremlin_behaviors.h>
 #include <zmk/hid.h>
 #include <zmk/matrix.h>
 
@@ -404,3 +405,53 @@ static int check_behavior_names(void) {
 
 SYS_INIT(check_behavior_names, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif // IS_ENABLED(CONFIG_LOG)
+
+int zmk_gremlin_behaviors_save_settings(void) {
+    int err = 0;
+#if (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_HOLD_TAP)
+    int r_ht = gremlin_hold_tap_save_all();
+    if (r_ht < 0 && err == 0) {
+        err = r_ht;
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_TAP_DANCE)
+    int r_td = gremlin_tap_dance_save_all();
+    if (r_td < 0 && err == 0) {
+        err = r_td;
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_MACRO)
+    int r_mac = gremlin_macro_save_all();
+    if (r_mac < 0 && err == 0) {
+        err = r_mac;
+    }
+#endif
+#endif
+    return err;
+}
+
+int zmk_gremlin_behaviors_reset_settings(void) {
+    int err = 0;
+#if (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_HOLD_TAP)
+    int r_ht = gremlin_hold_tap_reset_all();
+    if (r_ht < 0 && err == 0) {
+        err = r_ht;
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_TAP_DANCE)
+    int r_td = gremlin_tap_dance_reset_all();
+    if (r_td < 0 && err == 0) {
+        err = r_td;
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_MACRO)
+    int r_mac = gremlin_macro_reset_all();
+    if (r_mac < 0 && err == 0) {
+        err = r_mac;
+    }
+#endif
+#endif
+    return err;
+}

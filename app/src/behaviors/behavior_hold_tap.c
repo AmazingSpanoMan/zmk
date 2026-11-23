@@ -11,13 +11,19 @@
 #include <zmk/keys.h>
 #include <dt-bindings/zmk/keys.h>
 #include <zephyr/logging/log.h>
+#if IS_ENABLED(CONFIG_SETTINGS)
+#include <zephyr/settings/settings.h>
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <zmk/behavior.h>
+#include <zmk/gremlin_behaviors.h>
 #include <zmk/matrix.h>
 #include <zmk/endpoints.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/keycode_state_changed.h>
-#include <zmk/behavior.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -63,6 +69,10 @@ struct behavior_hold_tap_config {
     bool hold_while_undecided_linger;
     bool retro_tap;
     bool hold_trigger_on_release;
+    int gremlin_slot;
+    bool enabled;
+    struct zmk_behavior_binding fixed_hold_binding;
+    struct zmk_behavior_binding fixed_tap_binding;
     int32_t hold_trigger_key_positions_len;
     int32_t hold_trigger_key_positions[];
 };
@@ -410,8 +420,13 @@ static int press_hold_binding(struct active_hold_tap *hold_tap) {
 #endif
     };
 
-    struct zmk_behavior_binding binding = {.behavior_dev = hold_tap->config->hold_behavior_dev,
-                                           .param1 = hold_tap->param_hold};
+    struct zmk_behavior_binding binding = (hold_tap->config->gremlin_slot >= 0)
+        ? hold_tap->config->fixed_hold_binding
+        : (struct zmk_behavior_binding){.behavior_dev = hold_tap->config->hold_behavior_dev,
+                                        .param1 = hold_tap->param_hold};
+    if (!binding.behavior_dev) {
+        return 0;
+    }
     return zmk_behavior_invoke_binding(&binding, event, true);
 }
 
@@ -424,9 +439,14 @@ static int press_tap_binding(struct active_hold_tap *hold_tap) {
 #endif
     };
 
-    struct zmk_behavior_binding binding = {.behavior_dev = hold_tap->config->tap_behavior_dev,
-                                           .param1 = hold_tap->param_tap};
+    struct zmk_behavior_binding binding = (hold_tap->config->gremlin_slot >= 0)
+        ? hold_tap->config->fixed_tap_binding
+        : (struct zmk_behavior_binding){.behavior_dev = hold_tap->config->tap_behavior_dev,
+                                        .param1 = hold_tap->param_tap};
     store_last_hold_tapped(hold_tap);
+    if (!binding.behavior_dev) {
+        return 0;
+    }
     return zmk_behavior_invoke_binding(&binding, event, true);
 }
 
@@ -439,8 +459,13 @@ static int release_hold_binding(struct active_hold_tap *hold_tap) {
 #endif
     };
 
-    struct zmk_behavior_binding binding = {.behavior_dev = hold_tap->config->hold_behavior_dev,
-                                           .param1 = hold_tap->param_hold};
+    struct zmk_behavior_binding binding = (hold_tap->config->gremlin_slot >= 0)
+        ? hold_tap->config->fixed_hold_binding
+        : (struct zmk_behavior_binding){.behavior_dev = hold_tap->config->hold_behavior_dev,
+                                        .param1 = hold_tap->param_hold};
+    if (!binding.behavior_dev) {
+        return 0;
+    }
     return zmk_behavior_invoke_binding(&binding, event, false);
 }
 
@@ -453,8 +478,13 @@ static int release_tap_binding(struct active_hold_tap *hold_tap) {
 #endif
     };
 
-    struct zmk_behavior_binding binding = {.behavior_dev = hold_tap->config->tap_behavior_dev,
-                                           .param1 = hold_tap->param_tap};
+    struct zmk_behavior_binding binding = (hold_tap->config->gremlin_slot >= 0)
+        ? hold_tap->config->fixed_tap_binding
+        : (struct zmk_behavior_binding){.behavior_dev = hold_tap->config->tap_behavior_dev,
+                                        .param1 = hold_tap->param_tap};
+    if (!binding.behavior_dev) {
+        return 0;
+    }
     return zmk_behavior_invoke_binding(&binding, event, false);
 }
 
@@ -608,6 +638,10 @@ static int on_hold_tap_binding_pressed(struct zmk_behavior_binding *binding,
     const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);
     const struct behavior_hold_tap_config *cfg = dev->config;
 
+    if (cfg->gremlin_slot >= 0 && !cfg->enabled) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
+
     if (undecided_hold_tap != NULL) {
         LOG_DBG("ERROR another hold-tap behavior is undecided.");
         // if this happens, make sure the behavior events occur AFTER other position events.
@@ -642,8 +676,14 @@ static int on_hold_tap_binding_pressed(struct zmk_behavior_binding *binding,
 
 static int on_hold_tap_binding_released(struct zmk_behavior_binding *binding,
                                         struct zmk_behavior_binding_event event) {
+    const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);
+    const struct behavior_hold_tap_config *cfg = dev ? dev->config : NULL;
+
     struct active_hold_tap *hold_tap = find_hold_tap(event.position);
     if (hold_tap == NULL) {
+        if (cfg && cfg->gremlin_slot >= 0 && !cfg->enabled) {
+            return ZMK_BEHAVIOR_OPAQUE;
+        }
         LOG_ERR("ACTIVE_HOLD_TAP_CLEANED_UP_TOO_EARLY");
         return ZMK_BEHAVIOR_OPAQUE;
     }
@@ -683,6 +723,10 @@ static int hold_tap_parameter_metadata(const struct device *hold_tap,
     struct behavior_hold_tap_data *data = hold_tap->data;
     int err;
     struct behavior_parameter_metadata child_meta;
+
+    if (cfg->gremlin_slot >= 0) {
+        return zmk_behavior_get_empty_param_metadata(hold_tap, param_metadata);
+    }
 
     err = behavior_get_parameter_metadata(zmk_behavior_get_binding(cfg->hold_behavior_dev),
                                           &child_meta);
@@ -844,6 +888,17 @@ void behavior_hold_tap_timer_work_handler(struct k_work *item) {
     }
 }
 
+struct gremlin_ht_reg {
+    struct behavior_hold_tap_config *cfg;
+    bool custom;
+    bool dirty;
+    uint16_t pending_hold_id;
+    uint16_t pending_tap_id;
+};
+
+static struct gremlin_ht_reg gremlin_ht_registry[ZMK_GREMLIN_MAX_HOLD_TAPS];
+static K_MUTEX_DEFINE(gremlin_ht_mutex);
+
 static int behavior_hold_tap_init(const struct device *dev) {
     static bool init_first_run = true;
 
@@ -854,11 +909,282 @@ static int behavior_hold_tap_init(const struct device *dev) {
         }
     }
     init_first_run = false;
+
+    struct behavior_hold_tap_config *cfg = (struct behavior_hold_tap_config *)(uintptr_t)dev->config;
+    if (cfg && cfg->gremlin_slot >= 0 && cfg->gremlin_slot < ZMK_GREMLIN_MAX_HOLD_TAPS) {
+        gremlin_ht_registry[cfg->gremlin_slot].cfg = cfg;
+    }
+
     return 0;
 }
 
+static size_t gremlin_ht_slot_count_internal(void) {
+    size_t count = 0;
+    for (size_t i = 0; i < ZMK_GREMLIN_MAX_HOLD_TAPS; i++) {
+        if (gremlin_ht_registry[i].cfg != NULL) {
+            count++;
+        } else {
+            break;
+        }
+    }
+    return count;
+}
+
+size_t zmk_gremlin_hold_tap_count(void) { return gremlin_ht_slot_count_internal(); }
+
+int zmk_gremlin_hold_tap_get(size_t slot, struct zmk_gremlin_hold_tap_slot *out) {
+    if (slot >= ZMK_GREMLIN_MAX_HOLD_TAPS || !out) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+    struct behavior_hold_tap_config *cfg = gremlin_ht_registry[slot].cfg;
+    if (!cfg) {
+        k_mutex_unlock(&gremlin_ht_mutex);
+        return -ENODEV;
+    }
+    *out = (struct zmk_gremlin_hold_tap_slot){
+        .enabled = cfg->enabled,
+        .tapping_term_ms = cfg->tapping_term_ms,
+        .quick_tap_ms = cfg->quick_tap_ms,
+        .require_prior_idle_ms = cfg->require_prior_idle_ms,
+        .flavor = (uint8_t)cfg->flavor,
+        .retro_tap = cfg->retro_tap,
+        .hold_binding = cfg->fixed_hold_binding,
+        .tap_binding = cfg->fixed_tap_binding,
+    };
+    k_mutex_unlock(&gremlin_ht_mutex);
+    return 0;
+}
+
+int zmk_gremlin_hold_tap_set(size_t slot, const struct zmk_gremlin_hold_tap_slot *in) {
+    if (slot >= ZMK_GREMLIN_MAX_HOLD_TAPS || !in) {
+        return -EINVAL;
+    }
+
+    if (in->enabled) {
+        if (in->tapping_term_ms <= 0 || in->flavor > ZMK_GREMLIN_HT_TAP_PREFERRED) {
+            return -EINVAL;
+        }
+        if (in->hold_binding.behavior_dev &&
+            zmk_behavior_validate_binding(&in->hold_binding) < 0) {
+            return -EINVAL;
+        }
+        if (in->tap_binding.behavior_dev &&
+            zmk_behavior_validate_binding(&in->tap_binding) < 0) {
+            return -EINVAL;
+        }
+    }
+
+    k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+    struct gremlin_ht_reg *reg = &gremlin_ht_registry[slot];
+    struct behavior_hold_tap_config *cfg = reg->cfg;
+    if (!cfg) {
+        k_mutex_unlock(&gremlin_ht_mutex);
+        return -ENODEV;
+    }
+
+    for (int i = 0; i < ZMK_BHV_HOLD_TAP_MAX_HELD; i++) {
+        if (active_hold_taps[i].position != ZMK_BHV_HOLD_TAP_POSITION_NOT_USED &&
+            active_hold_taps[i].config == cfg) {
+            k_work_cancel_delayable(&active_hold_taps[i].work);
+            if (undecided_hold_tap == &active_hold_taps[i]) {
+                undecided_hold_tap = NULL;
+            }
+            clear_hold_tap(&active_hold_taps[i]);
+        }
+    }
+
+    cfg->enabled = in->enabled;
+    cfg->tapping_term_ms = in->tapping_term_ms > 0 ? in->tapping_term_ms : 200;
+    cfg->quick_tap_ms = in->quick_tap_ms;
+    cfg->require_prior_idle_ms = in->require_prior_idle_ms;
+    cfg->flavor = (enum flavor)in->flavor;
+    cfg->retro_tap = in->retro_tap;
+    cfg->fixed_hold_binding = in->hold_binding;
+    cfg->fixed_tap_binding = in->tap_binding;
+    reg->custom = true;
+    reg->dirty = true;
+    reg->pending_hold_id = UINT16_MAX;
+    reg->pending_tap_id = UINT16_MAX;
+
+    k_mutex_unlock(&gremlin_ht_mutex);
+    return 0;
+}
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+#define GREMLIN_HT_NVS_MAGIC 0x47485431U
+
+struct gremlin_ht_nvs_rec {
+    uint32_t magic;
+    int32_t tapping_term_ms;
+    int32_t quick_tap_ms;
+    int32_t require_prior_idle_ms;
+    uint16_t hold_local_id;
+    uint16_t tap_local_id;
+    uint32_t hold_param1;
+    uint32_t hold_param2;
+    uint32_t tap_param1;
+    uint32_t tap_param2;
+    uint8_t enabled;
+    uint8_t flavor;
+    uint8_t retro_tap;
+    uint8_t reserved;
+};
+
+int gremlin_hold_tap_save_all(void) {
+    int err = 0;
+    for (size_t s = 0; s < ZMK_GREMLIN_MAX_HOLD_TAPS; s++) {
+        k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+        struct gremlin_ht_reg *reg = &gremlin_ht_registry[s];
+        struct behavior_hold_tap_config *cfg = reg->cfg;
+        bool should_save = cfg && reg->dirty && reg->custom;
+        struct gremlin_ht_nvs_rec rec = {0};
+        if (should_save) {
+            rec.magic = GREMLIN_HT_NVS_MAGIC;
+            rec.tapping_term_ms = cfg->tapping_term_ms;
+            rec.quick_tap_ms = cfg->quick_tap_ms;
+            rec.require_prior_idle_ms = cfg->require_prior_idle_ms;
+            rec.hold_local_id = cfg->fixed_hold_binding.behavior_dev
+                ? zmk_behavior_get_local_id(cfg->fixed_hold_binding.behavior_dev)
+                : UINT16_MAX;
+            rec.tap_local_id = cfg->fixed_tap_binding.behavior_dev
+                ? zmk_behavior_get_local_id(cfg->fixed_tap_binding.behavior_dev)
+                : UINT16_MAX;
+            rec.hold_param1 = cfg->fixed_hold_binding.param1;
+            rec.hold_param2 = cfg->fixed_hold_binding.param2;
+            rec.tap_param1 = cfg->fixed_tap_binding.param1;
+            rec.tap_param2 = cfg->fixed_tap_binding.param2;
+            rec.enabled = cfg->enabled ? 1U : 0U;
+            rec.flavor = (uint8_t)cfg->flavor;
+            rec.retro_tap = cfg->retro_tap ? 1U : 0U;
+        }
+        k_mutex_unlock(&gremlin_ht_mutex);
+
+        if (!should_save) {
+            continue;
+        }
+
+        char key[24];
+        snprintf(key, sizeof(key), "gremlin_ht/%u", (unsigned int)s);
+        int r = settings_save_one(key, &rec, sizeof(rec));
+        if (r == 0) {
+            k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+            reg->dirty = false;
+            k_mutex_unlock(&gremlin_ht_mutex);
+        } else if (err == 0) {
+            err = r;
+        }
+    }
+    return err;
+}
+
+int gremlin_hold_tap_reset_all(void) {
+    int err = 0;
+    for (size_t s = 0; s < ZMK_GREMLIN_MAX_HOLD_TAPS; s++) {
+        char key[24];
+        snprintf(key, sizeof(key), "gremlin_ht/%u", (unsigned int)s);
+        int r = settings_delete(key);
+        if (r < 0 && r != -ENOENT && err == 0) {
+            err = r;
+        }
+        k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+        struct gremlin_ht_reg *reg = &gremlin_ht_registry[s];
+        if (reg->cfg) {
+            reg->cfg->enabled = false;
+            reg->cfg->tapping_term_ms = 200;
+            reg->cfg->quick_tap_ms = -1;
+            reg->cfg->require_prior_idle_ms = -1;
+            reg->cfg->flavor = FLAVOR_HOLD_PREFERRED;
+            reg->cfg->retro_tap = false;
+            reg->cfg->fixed_hold_binding = (struct zmk_behavior_binding){0};
+            reg->cfg->fixed_tap_binding = (struct zmk_behavior_binding){0};
+        }
+        reg->custom = false;
+        reg->dirty = false;
+        reg->pending_hold_id = UINT16_MAX;
+        reg->pending_tap_id = UINT16_MAX;
+        k_mutex_unlock(&gremlin_ht_mutex);
+    }
+    return err;
+}
+
+static int gremlin_ht_settings_set(const char *name, size_t len, settings_read_cb read_cb,
+                                   void *cb_arg) {
+    if (!name || *name == '\0') {
+        return -ENOENT;
+    }
+
+    char *endptr = NULL;
+    unsigned long slot = strtoul(name, &endptr, 10);
+    if (endptr == name || *endptr != '\0' || slot >= ZMK_GREMLIN_MAX_HOLD_TAPS) {
+        return -ENOENT;
+    }
+
+    struct gremlin_ht_nvs_rec rec;
+    if (len != sizeof(rec)) {
+        return -EINVAL;
+    }
+
+    int rc = read_cb(cb_arg, &rec, sizeof(rec));
+    if (rc < 0) {
+        return rc;
+    }
+    if (rec.magic != GREMLIN_HT_NVS_MAGIC) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+    struct gremlin_ht_reg *reg = &gremlin_ht_registry[slot];
+    if (reg->cfg) {
+        reg->cfg->enabled = rec.enabled != 0U;
+        reg->cfg->tapping_term_ms = rec.tapping_term_ms;
+        reg->cfg->quick_tap_ms = rec.quick_tap_ms;
+        reg->cfg->require_prior_idle_ms = rec.require_prior_idle_ms;
+        reg->cfg->flavor = (enum flavor)rec.flavor;
+        reg->cfg->retro_tap = rec.retro_tap != 0U;
+        reg->cfg->fixed_hold_binding = (struct zmk_behavior_binding){
+            .behavior_dev = NULL, .param1 = rec.hold_param1, .param2 = rec.hold_param2};
+        reg->cfg->fixed_tap_binding = (struct zmk_behavior_binding){
+            .behavior_dev = NULL, .param1 = rec.tap_param1, .param2 = rec.tap_param2};
+        reg->pending_hold_id = rec.hold_local_id;
+        reg->pending_tap_id = rec.tap_local_id;
+        reg->custom = true;
+        reg->dirty = false;
+    }
+    k_mutex_unlock(&gremlin_ht_mutex);
+    return 0;
+}
+
+static int gremlin_ht_settings_commit(void) {
+    k_mutex_lock(&gremlin_ht_mutex, K_FOREVER);
+    for (size_t s = 0; s < ZMK_GREMLIN_MAX_HOLD_TAPS; s++) {
+        struct gremlin_ht_reg *reg = &gremlin_ht_registry[s];
+        if (!reg->cfg || !reg->custom) {
+            continue;
+        }
+        if (reg->pending_hold_id != UINT16_MAX && !reg->cfg->fixed_hold_binding.behavior_dev) {
+            reg->cfg->fixed_hold_binding.behavior_dev =
+                zmk_behavior_find_behavior_name_from_local_id(reg->pending_hold_id);
+        }
+        if (reg->pending_tap_id != UINT16_MAX && !reg->cfg->fixed_tap_binding.behavior_dev) {
+            reg->cfg->fixed_tap_binding.behavior_dev =
+                zmk_behavior_find_behavior_name_from_local_id(reg->pending_tap_id);
+        }
+    }
+    k_mutex_unlock(&gremlin_ht_mutex);
+    return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(gremlin_ht, "gremlin_ht", NULL, gremlin_ht_settings_set,
+                               gremlin_ht_settings_commit, NULL);
+#else
+int gremlin_hold_tap_save_all(void) { return 0; }
+int gremlin_hold_tap_reset_all(void) { return 0; }
+#endif
+
 #define KP_INST(n)                                                                                 \
-    static const struct behavior_hold_tap_config behavior_hold_tap_config_##n = {                  \
+    static struct behavior_hold_tap_config behavior_hold_tap_config_##n = {                        \
         .tapping_term_ms = DT_INST_PROP(n, tapping_term_ms),                                       \
         .hold_behavior_dev = DEVICE_DT_NAME(DT_INST_PHANDLE_BY_IDX(n, bindings, 0)),               \
         .tap_behavior_dev = DEVICE_DT_NAME(DT_INST_PHANDLE_BY_IDX(n, bindings, 1)),                \
@@ -871,6 +1197,8 @@ static int behavior_hold_tap_init(const struct device *dev) {
         .hold_while_undecided_linger = DT_INST_PROP(n, hold_while_undecided_linger),               \
         .retro_tap = DT_INST_PROP(n, retro_tap),                                                   \
         .hold_trigger_on_release = DT_INST_PROP(n, hold_trigger_on_release),                       \
+        .gremlin_slot = DT_INST_PROP_OR(n, gremlin_slot, -1),                                      \
+        .enabled = !DT_INST_NODE_HAS_PROP(n, gremlin_slot),                                        \
         .hold_trigger_key_positions = DT_INST_PROP(n, hold_trigger_key_positions),                 \
         .hold_trigger_key_positions_len = DT_INST_PROP_LEN(n, hold_trigger_key_positions),         \
     };                                                                                             \
